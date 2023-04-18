@@ -1,0 +1,497 @@
+# This script is intended to be used in Kibana DEV console for demonstration purpose
+
+# Index first round of restaurants
+POST _bulk
+{ "index" : { "_index" : "restaurant", "_id" : "001sabichuong" } }
+{ "restaurant_name": "Sa Bi Chuong", "cuisine": "Vietnamese", "rating": 5.0 }
+{ "index" : { "_index" : "restaurant", "_id" : "002vietnamesephonoodle" } }
+{ "restaurant_name": "Vietnamese Pho Noodle", "cuisine": "Vietnamese", "rating": 4.0 }
+
+
+# Test searching for one
+# Should return Vietnamese Pho Noodle
+GET restaurant/_search
+{
+  "query" : {
+    "match" : { "restaurant_name": "vietnamese" }
+  }
+}
+
+
+# Matching multiple fields
+# Should return all 2 Vietnamese restaurant with the Vietnamese Pho Noodle on top
+GET restaurant/_search
+{
+  "query" : {
+    "multi_match" : {
+      "query": "vietnamese",
+      "fields": [ "restaurant_name", "cuisine" ]
+    }
+  }
+}
+
+
+# Let's use explain=true to see what happens under the hood
+# Vietnamese Pho Noodle is on top because of the default implementation of TFIDF that penalizes the matching at cuisine field because there are multiple restaurants with cuisine=Vietnamese while there are only one restaurant with name=Vietnamese
+# Question: But why having the name Vietnamese in its name makes it more Vietnamese than other restaurants?
+GET restaurant/_search
+{
+  "query" : {
+    "multi_match" : {
+      "query": "vietnamese",
+      "fields": [ "restaurant_name", "cuisine" ]
+    }
+  },
+  "explain": true
+}
+
+
+# Another problem with TFIDF is that it takes into account field length
+# Let's add another restaurant
+POST _bulk
+{ "index" : { "_index" : "restaurant", "_id" : "003vietnamesepho" } }
+{ "restaurant_name": "Vietnamese Pho", "cuisine": "Vietnamese", "rating": 3.0 }
+
+# In the below example we see that the new Vietnamese Pho restaurant is ranked higher...
+GET restaurant/_search
+{
+  "query" : {
+    "multi_match" : {
+      "query": "vietnamese pho",
+      "fields": [ "restaurant_name", "cuisine" ]
+    }
+  },
+  "explain": false
+}
+
+# ... because it has less words than Vietnamese Pho Noodle
+GET restaurant/_search
+{
+  "query" : {
+    "multi_match" : {
+      "query": "vietnamese pho",
+      "fields": [ "restaurant_name", "cuisine" ]
+    }
+  },
+  "explain": true
+}
+
+
+# Now, can we use rating to improve our ranking? Anyway if everything else equal then a restaurant with better rating should be ranked above, shouldn't it?
+# One reasonable approach is to boost the score based on the ratings
+GET restaurant/_search
+{
+  "query": {
+    "function_score": {
+      "query": {
+        "multi_match" : {
+          "query": "vietnamese",
+          "fields": [ "restaurant_name", "cuisine" ]
+        }
+      },
+      "functions": [
+        {
+          "field_value_factor": {
+            "field": "rating",
+            "modifier": "none",
+            "missing": 1
+          }
+        }
+      ],
+      "score_mode": "max",
+      "boost_mode": "multiply"
+    }
+  },
+  "explain": false
+}
+# The results now look better, as we can see Vietnamese Pho Noodle with rating=4 ranks higher than Vietnamese Pho with rating=3
+# But how about Sa Bi Chuong with rating=5? It's likely that the boost from rating isn't enough to make that restaurant on top. We might start tinkering with the function_score feature to derive a better model
+# Be careful, though, based on my own experience, with more and more requirements (such as fuzzy matching and other boosting factors like distance), our query will soon be very hard to manage and every modification of one clause in the query can lead to unexpected behavior.
+# For example, let's say to fix our above ranking problem, we can increase the boost for rating=5
+# Should expect to se Sa Bi Chuong now ranks on top
+GET restaurant/_search
+{
+  "query": {
+    "function_score": {
+      "query": {
+        "multi_match" : {
+          "query": "vietnamese",
+          "fields": [ "restaurant_name", "cuisine" ]
+        }
+      },
+      "functions": [
+        {
+          "filter": {
+            "range": {
+              "rating": {
+                "gte": 5,
+                "lte": 5
+              }
+            }
+          },
+          "weight": 10
+        },
+        {
+          "filter": {
+            "range": {
+              "rating": {
+                "gte": 4,
+                "lt": 5
+              }
+            }
+          },
+          "weight": 2
+        }
+      ],
+      "score_mode": "max",
+      "boost_mode": "multiply"
+    }
+  },
+  "explain": false
+}
+
+
+# Now, say we want to handle fuzzy matching as well
+# Current query can not handle typo so we shouldn't see any results returned
+GET restaurant/_search
+{
+  "query": {
+    "function_score": {
+      "query": {
+        "multi_match" : {
+          "query": "vietnames",
+          "fields": [ "restaurant_name", "cuisine" ]
+        }
+      },
+      "functions": [
+        {
+          "filter": {
+            "range": {
+              "rating": {
+                "gte": 5,
+                "lte": 5
+              }
+            }
+          },
+          "weight": 10
+        },
+        {
+          "filter": {
+            "range": {
+              "rating": {
+                "gte": 4,
+                "lt": 5
+              }
+            }
+          },
+          "weight": 2
+        }
+      ],
+      "score_mode": "max",
+      "boost_mode": "multiply"
+    }
+  },
+  "explain": false
+}
+
+# Let's add a fuzzy matching clause, this time defined in a template so that we can re-use
+# The use of `bool` query below is to implement the logic: At least one condition should match
+PUT _scripts/01-default-fuzzy-search-template
+{
+  "script": {
+    "lang": "mustache",
+    "source": {
+      "query": {
+        "function_score": {
+          "query": {
+            "bool": {
+              "must": [
+                {
+                  "bool": {
+                    "should": [
+                      {
+                        "multi_match" : {
+                          "query": "{{query_string}}",
+                          "fields": [ "restaurant_name", "cuisine" ]
+                        }
+                      },
+                      {
+                        "multi_match" : {
+                          "query": "{{query_string}}",
+                          "fields": [ "restaurant_name", "cuisine" ],
+                          "fuzziness": "AUTO"
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "functions": [
+            {
+              "filter": {
+                "range": {
+                  "rating": {
+                    "gte": 5,
+                    "lte": 5
+                  }
+                }
+              },
+              "weight": 10
+            },
+            {
+              "filter": {
+                "range": {
+                  "rating": {
+                    "gte": 4,
+                    "lt": 5
+                  }
+                }
+              },
+              "weight": 2
+            }
+          ],
+          "score_mode": "max",
+          "boost_mode": "multiply"
+        }
+      }
+    },
+    "params": {
+      "query_string": "My query string"
+    }
+  }
+}
+
+GET /_search/template
+{
+  "id": "01-default-fuzzy-search-template",
+  "params": {
+    "query_string": "vietnames"
+  },
+  "explain": false
+}
+# Looks ok now!
+
+
+# But what if we have this two restaurants
+POST _bulk
+{ "index" : { "_index" : "restaurant", "_id" : "004parkhangseokbbq" } }
+{ "restaurant_name": "Park Hang-seo's KBBQ", "cuisine": "Korean", "rating": 2.0 }
+{ "index" : { "_index" : "restaurant", "_id" : "005bestbbqintown" } }
+{ "restaurant_name": "Best BBQ in town", "cuisine": "Japanese", "rating": 5.0 }
+
+# It's reasonable to expect that if user searches for "kbbq" then the Park Hang-seo's KBBQ should be returned on top of the Best BBQ in town regardless of the rating
+# However, the below query should return Best BBQ in town over Park Hang-seo's KBBQ
+GET restaurant/_search/template
+{
+  "id": "01-default-fuzzy-search-template",
+  "params": {
+    "query_string": "kbbq"
+  },
+  "explain": false
+}
+# As we can probably expect, boosting by rating can lead to fuzzy matching to have higher score than exact matching
+
+# Actually, this is when we should think about creating an offline evaluation dataset for our search application
+# Should expect to see metric_score < 1.0 because the ranking for kbbq keyword is not ideal
+GET restaurant/_rank_eval
+{
+  "templates": [
+     {
+        "id": "01-default-fuzzy-search-template",
+        "template": { 
+            "id": "01-default-fuzzy-search-template"
+        }
+     }
+  ],
+  "requests": [
+    {
+     "id": "kbbq_query",
+     "ratings": [
+        { "_index": "restaurant", "_id": "004parkhangseokbbq", "rating": 3 },
+        { "_index": "restaurant", "_id": "005bestbbqintown", "rating": 1 }
+      ],
+     "template_id": "01-default-fuzzy-search-template",
+     "params": { 
+        "query_string": "kbbq"
+      }
+    },
+    {
+     "id": "vietnamese_query",
+     "ratings": [
+        { "_index": "restaurant", "_id": "001sabichuong", "rating": 3 },
+        { "_index": "restaurant", "_id": "002vietnamesephonoodle", "rating": 3 },
+        { "_index": "restaurant", "_id": "003vietnamesepho", "rating": 3 }
+      ],
+     "template_id": "01-default-fuzzy-search-template", 
+     "params": { 
+        "query_string": "vietnamese"
+      }
+    }
+  ],
+  "metric": {
+    "dcg": {
+      "k": 5,
+      "normalize": true
+    }
+  }
+}
+
+
+# Now, let’s pause and think about the search logic
+# We want exact match to always surface on top of not-exact match
+# For all documents that fall into exact matching, we want to rerank them by rating. Same logic applies for not-exact match
+# IMO, this very much resembles the ranking of the Football League system, where we have one ultimate measure which is the Points (earning by match result), where if team A has more points than team B then rank(A) > rank(B) no matter how many goals team A has scored. All those other factors are called tie-breakers, which indicates they’re being used only to break the ties.
+# One approach that helps implement this model is to use `dis_max` combined with `constant_score` to create levels of matching while making sure the boosting will never cause a low level matching to have higher score than higher level matching
+# `dis_max` query gets the max score of an array of clauses
+# `constant_score` says that if matches, return a constant score
+# Here's an implementation of that model
+PUT _scripts/02-constant-score-search-template
+{
+  "script": {
+    "lang": "mustache",
+    "source": {
+      "query": {
+        "function_score": {
+          "query": {
+            "bool": {
+              "must": [
+                {
+                  "bool": {
+                    "should": [
+                      {
+                        "dis_max": {
+                          "queries": [
+                            {
+                              "constant_score": {
+                                "filter": {
+                                  "multi_match" : {
+                                    "query": "{{query_string}}",
+                                    "fields": [ "restaurant_name", "cuisine" ]
+                                  }
+                                },
+                                "boost": 2
+                              }
+                            },
+                            {
+                              "constant_score": {
+                                "filter": {
+                                  "multi_match" : {
+                                    "query": "{{query_string}}",
+                                    "fields": [ "restaurant_name", "cuisine" ],
+                                    "fuzziness": "AUTO"
+                                  }
+                                },
+                                "boost": 1
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          "functions": [
+            {
+              "weight": 1
+            },
+            {
+              "field_value_factor": {
+                "field": "rating",
+                "modifier": "ln",
+                "missing": 1
+              },
+              "weight": 0.1
+            }
+          ],
+          "score_mode": "sum",
+          "boost_mode": "multiply"
+        }
+      }
+    },
+    "params": {
+      "query_string": "My query string"
+    }
+  }
+}
+
+
+GET restaurant/_search/template
+{
+  "id": "02-constant-score-search-template",
+  "params": {
+    "query_string": "kbbq"
+  },
+  "explain": false
+}
+# We can see that Park Hang-seo's KBBQ is surfaced on top of the Best BBQ in town
+# Notice that the scores also indicate where the matches are
+
+
+# Checking vietnamese, we can see that Sa Bi Chuong (rating 5) > Vietnamese Pho Noodle (4) > Vietnamese Pho (3)
+GET restaurant/_search/template
+{
+  "id": "02-constant-score-search-template",
+  "params": {
+    "query_string": "vietnamese"
+  },
+  "explain": false
+}
+
+
+# Run the evaluation again
+# Should expect to see metric_score = 1.0
+GET restaurant/_rank_eval
+{
+  "templates": [
+     {
+        "id": "02-constant-score-search-template",
+        "template": { 
+            "id": "02-constant-score-search-template"
+        }
+     }
+  ],
+  "requests": [
+    {
+     "id": "kbbq_query",
+     "ratings": [
+        { "_index": "restaurant", "_id": "004parkhangseokbbq", "rating": 3 },
+        { "_index": "restaurant", "_id": "005bestbbqintown", "rating": 1 }
+      ],
+     "template_id": "02-constant-score-search-template", 
+     "params": { 
+        "query_string": "kbbq"
+      }
+    },
+    {
+     "id": "vietnamese_query",
+     "ratings": [
+        { "_index": "restaurant", "_id": "001sabichuong", "rating": 3 },
+        { "_index": "restaurant", "_id": "002vietnamesephonoodle", "rating": 3 },
+        { "_index": "restaurant", "_id": "003vietnamesepho", "rating": 3 }
+      ],
+     "template_id": "02-constant-score-search-template", 
+     "params": { 
+        "query_string": "vietnamese"
+      }
+    }
+  ],
+  "metric": {
+    "dcg": {
+      "k": 5,
+      "normalize": true
+    }
+  }
+}
+
+
+# Delete index
+DELETE restaurant
+
+# Delete scripts
+DELETE _scripts/01-default-fuzzy-search-template
+DELETE _scripts/02-constant-score-search-template
