@@ -1,6 +1,6 @@
 # This script is intended to be used in Kibana DEV console for demonstration purpose
 
-# Index first round of restaurants
+# Index our first restaurants
 POST _bulk
 { "index" : { "_index" : "restaurant", "_id" : "001sabichuong" } }
 { "restaurant_name": "Sa Bi Chuong", "cuisine": "Vietnamese", "rating": 5.0 }
@@ -346,6 +346,9 @@ GET restaurant/_rank_eval
 # One approach that helps implement this model is to use `dis_max` combined with `constant_score` to create levels of matching while making sure the boosting will never cause a low level matching to have higher score than higher level matching
 # `dis_max` query gets the max score of an array of clauses
 # `constant_score` says that if matches, return a constant score
+# Note that the choice of constant scores and boosting weights are made with purpose
+# to make sure that the maximum boosting will not make matching at lower level to have
+# higher score than matching at upper level
 # Here's an implementation of that model
 PUT _scripts/02-constant-score-search-template
 {
